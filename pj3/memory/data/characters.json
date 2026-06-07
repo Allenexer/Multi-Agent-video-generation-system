@@ -1,0 +1,16 @@
+{
+  "452563e18c8e": {
+    "design": {
+      "appearance": "a tall figure with red hat"
+    },
+    "created_at": "2026-05-26T17:26:56.507626",
+    "name": "test_char"
+  },
+  "059758bfeb90": {
+    "design": {
+      "look": "tall figure"
+    },
+    "created_at": "2026-05-26T17:27:28.678509",
+    "name": "c1"
+  }
+}

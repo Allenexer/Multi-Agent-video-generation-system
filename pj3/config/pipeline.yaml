@@ -1,0 +1,44 @@
+# ── Pipeline 定义 ──
+# 定义 Agent 执行顺序和并行策略
+# stages 按顺序执行，每个 stage 内的 agents 按 agents 数组顺序执行
+# parallel: true 表示该 stage 内的所有 agents 可并行执行（互不依赖）
+
+name: "默认视频生成流水线"
+
+stages:
+  - id: "planning"
+    name: "1. 意图解析"
+    description: "Director 解析用户需求，生成任务计划"
+    parallel: false
+    agents:
+      - "director"
+
+  - id: "analysis"
+    name: "2. 并行分析"
+    description: "风格分析、脚本展开、角色设计三者互不依赖，可同步进行"
+    parallel: true
+    agents:
+      - "style_analyzer"
+      - "script_writer"
+      - "character_designer"
+
+  - id: "storyboard"
+    name: "3. 分镜生成"
+    description: "融合上游分析结果，生成详细分镜表"
+    parallel: false
+    agents:
+      - "scene_planner"
+
+  - id: "optimization"
+    name: "4. Prompt 优化"
+    description: "为每个镜头优化生成 prompt"
+    parallel: false
+    agents:
+      - "prompt_engineer"
+
+  - id: "review"
+    name: "5. 一致性检查"
+    description: "跨镜头角色/场景/风格一致性评审"
+    parallel: false
+    agents:
+      - "consistency_guard"

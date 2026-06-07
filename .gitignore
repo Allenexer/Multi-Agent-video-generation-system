@@ -1,0 +1,33 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# Generated outputs
+outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Excluded from repo
+arxiv*/
+*.zip
+*.pptx
+~$*
+
+# Chinese docs (keep README.md)
+GUIDE.md
+CODE_REVIEW.md
+项目说明.md
+技术困难分析.md
+分工方案.md
+SETUP.md
