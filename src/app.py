@@ -2,7 +2,7 @@
 Gradio UI — Multi-Agent Video Generation System.
 
 Three tabs:
-  1. Generate  — text input + image upload → execute pipeline → view results
+  1. Generate  — stepped pipeline: Planning → Generation → Composition
   2. Config    — per-agent Provider/Model selection
   3. Pipeline  — online YAML editor for providers.yaml + pipeline.yaml
 
@@ -12,29 +12,18 @@ import queue
 import threading
 import gradio as gr
 from core.config_manager import ConfigManager
-from core.pipeline import PipelineExecutor
+from core.pipeline import PipelineExecutor, PipelineSession
 
 cfg = ConfigManager.get_instance()
 executor = PipelineExecutor(cfg)
 
 
 # ═══════════════════════════════════════════════════
-#  Tab 1: Generate
+#  Tab 1: Generate (stepped: Planning → Generation → Composition)
 # ═══════════════════════════════════════════════════
 
-def handle_generate(text_input, style_refs, char_ref, duration):
-    """
-    Generator that runs the pipeline in a background thread and yields
-    (storyboard, video, logs) as progress arrives.
-
-    style_refs: list of file paths for style reference images (multi-universe)
-    char_ref:   single character reference image
-    """
-    if not text_input.strip():
-        yield {}, None, "[提示] 请输入视频描述。"
-        return
-
-    # gr.File(file_count="multiple") may return None, a single path, or a list
+def _normalize_images(style_refs, char_ref):
+    """Normalize Gradio File/Image inputs to flat path lists."""
     if style_refs is None:
         style_images = []
     elif isinstance(style_refs, str):
@@ -42,84 +31,184 @@ def handle_generate(text_input, style_refs, char_ref, duration):
     else:
         style_images = [f for f in style_refs if f is not None]
     char_images = [char_ref] if char_ref is not None else []
+    return style_images, char_images
 
-    # Inject duration into user input so agents can use it
-    if duration and duration != 10:
-        full_input = f"{text_input.strip()}，时长{duration}秒"
-    else:
-        full_input = text_input
 
+def _run_in_thread(fn, *args):
+    """Run fn in a daemon thread; return (thread, queue) for polling."""
     q = queue.Queue()
-    display_logs = []
-    storyboard = {}
-    video_path = None
 
-    def progress_callback(msg_type, data):
-        q.put((msg_type, data))
-
-    def run_pipeline():
-        nonlocal storyboard, video_path
+    def wrapper():
         try:
-            result = executor.run(
-                user_input=full_input,
-                style_images=style_images or None,
-                character_images=char_images or None,
-                progress_callback=progress_callback,
-            )
-            # Extract storyboard
-            for val in result.get("context", {}).values():
-                if isinstance(val, dict) and "shots" in val:
-                    storyboard = val
-                    break
-            comp = result.get("composition", {})
-            if comp.get("output_path"):
-                video_path = comp.get("output_path")
+            result = fn(*args, progress_callback=lambda m, d: q.put((m, d)))
             q.put(("done", result))
         except Exception as e:
             q.put(("error", str(e)))
 
-    thread = threading.Thread(target=run_pipeline, daemon=True)
-    thread.start()
+    t = threading.Thread(target=wrapper, daemon=True)
+    t.start()
+    return t, q
 
-    # Poll queue and yield updates
-    while thread.is_alive() or not q.empty():
+
+def _drain_queue(q, display_logs):
+    """Drain all available messages from queue. Non-blocking — returns immediately.
+
+    Returns (result, error) where result is the 'done' payload or None.
+    """
+    result = None
+    error = None
+    while True:
         try:
-            msg_type, data = q.get(timeout=0.5)
+            msg_type, data = q.get_nowait()
             if msg_type == "log":
                 display_logs.append(data)
             elif msg_type == "agent_start":
                 display_logs.append(f"  ⏳ {data} 执行中...")
-                yield storyboard, video_path, "\n".join(display_logs)
             elif msg_type == "agent_done":
-                # Replace the "执行中" line with completed
                 for j in range(len(display_logs) - 1, -1, -1):
                     if f"⏳ {data}" in display_logs[j]:
                         display_logs[j] = f"  ✓ {data}"
                         break
             elif msg_type == "done":
-                for line in data.get("logs", []):
-                    if line not in display_logs:
-                        display_logs.append(line)
-                run_dir = data.get("run_dir", "")
-                if run_dir:
-                    display_logs.append(f"\n[输出目录] {run_dir}")
-                errors = data.get("errors", [])
-                if errors:
-                    display_logs.append(f"\n── {len(errors)} 个错误 ──")
-                    for e in errors:
-                        display_logs.append(f"  ! {e}")
+                result = data
             elif msg_type == "error":
-                display_logs.append(f"\n[系统错误] {data}")
-            yield storyboard, video_path, "\n".join(display_logs)
+                error = data
+                display_logs.append(f"\n[错误] {data}")
         except queue.Empty:
-            yield storyboard, video_path, "\n".join(display_logs)
+            break
+    return result, error
 
-    # Final yield
-    yield storyboard, video_path, "\n".join(display_logs)
 
+# ── Step 1: Planning ──
+
+def handle_planning(text_input, style_refs, char_ref, duration, session_state):
+    """Run planning phase. Yields (storyboard, video, logs, session, gen_btn)."""
+    if not text_input or not text_input.strip():
+        yield {}, None, "[提示] 请输入视频描述。", session_state, gr.update(interactive=False)
+        return
+
+    style_images, char_images = _normalize_images(style_refs, char_ref)
+
+    if duration and duration != 10:
+        full_input = f"{text_input.strip()}，时长{duration}秒"
+    else:
+        full_input = text_input.strip()
+
+    display_logs = ["⏳ 启动规划阶段..."]
+    session = executor.start_session(full_input, style_images, char_images)
+
+    thread, q = _run_in_thread(executor.run_planning, session)
+    yield {}, None, "\n".join(display_logs), session, gr.update(interactive=False)
+
+    import time
+    result = None
+    while thread.is_alive() or not q.empty():
+        result, _err = _drain_queue(q, display_logs)
+        if result:
+            storyboard = result.context.get("scene_planner", {})
+            display_logs.append(f"\n✓ 规划完成 — 输出目录: {result.run_dir}")
+            yield (storyboard, None, "\n".join(display_logs),
+                   result, gr.update(interactive=True))
+            return
+        yield ({}, None, "\n".join(display_logs), session,
+               gr.update(interactive=False))
+        time.sleep(0.3)
+
+    # Thread ended without "done" — check for errors
+    _drain_queue(q, display_logs)
+    yield ({}, None, "\n".join(display_logs), session,
+           gr.update(interactive=False))
+
+
+# ── Step 2: Generation ──
+
+def handle_generation(session_state):
+    """Run generation phase. Yields (storyboard, video, logs, session, compose_btn)."""
+    if session_state is None or session_state.phase != "planned":
+        yield ({}, None, "[提示] 请先完成规划。",
+               session_state, gr.update(interactive=False))
+        return
+
+    display_logs = list(session_state.logs)
+    display_logs.append("⏳ 开始视频生成...")
+
+    thread, q = _run_in_thread(executor.run_generation, session_state)
+    yield (session_state.context.get("scene_planner", {}),
+           None, "\n".join(display_logs),
+           session_state, gr.update(interactive=False))
+
+    import time
+    result = None
+    while thread.is_alive() or not q.empty():
+        result, _err = _drain_queue(q, display_logs)
+        if result:
+            n_ok = sum(
+                1 for s in result.final_shots if not s.get("error"))
+            display_logs.append(
+                f"\n✓ 生成完成 — {n_ok}/{len(result.final_shots)} 个镜头成功")
+            has_ok = n_ok > 0
+            yield (result.context.get("scene_planner", {}),
+                   None, "\n".join(display_logs), result,
+                   gr.update(interactive=has_ok))
+            return
+        yield (session_state.context.get("scene_planner", {}),
+               None, "\n".join(display_logs), session_state,
+               gr.update(interactive=False))
+        time.sleep(0.3)
+
+    _drain_queue(q, display_logs)
+    yield (session_state.context.get("scene_planner", {}),
+           None, "\n".join(display_logs), session_state,
+           gr.update(interactive=False))
+
+
+# ── Step 3: Composition ──
+
+def handle_composition(session_state):
+    """Run composition phase. Yields (storyboard, video, logs, session)."""
+    if session_state is None or session_state.phase != "generated":
+        yield ({}, None, "[提示] 请先完成视频生成。", session_state)
+        return
+
+    display_logs = list(session_state.logs)
+    display_logs.append("⏳ 开始视频拼接...")
+
+    thread, q = _run_in_thread(executor.run_composition, session_state)
+    yield ({}, None, "\n".join(display_logs), session_state)
+
+    import time
+    result = None
+    while thread.is_alive() or not q.empty():
+        result, _err = _drain_queue(q, display_logs)
+        if result:
+            comp = result.composition
+            video_path = (
+                comp.get("output_path")
+                if comp.get("status") != "error" else None)
+            if video_path:
+                display_logs.append(f"\n✓ 拼接完成 — {video_path}")
+            yield ({}, video_path, "\n".join(display_logs), result)
+            return
+        yield ({}, None, "\n".join(display_logs), session_state)
+        time.sleep(0.3)
+
+    _drain_queue(q, display_logs)
+    yield ({}, None, "\n".join(display_logs), session_state)
+
+
+# ── Step 4: Reset ──
+
+def handle_reset():
+    """Reset all state for a new run."""
+    return {}, None, "", None, gr.update(interactive=False), gr.update(interactive=False)
+
+
+# ── Build UI ──
 
 def build_generation_tab():
-    gr.Markdown("## 视频生成")
+    gr.Markdown("## 视频生成（分步执行）")
+    gr.Markdown(
+        "**① 开始规划** → 预览分镜 → **② 生成视频** → 检查镜头 → **③ 拼接输出**")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -128,24 +217,55 @@ def build_generation_tab():
                 placeholder="赛博朋克街景，主角在霓虹灯照耀的雨夜中行走，10秒",
                 lines=4,
             )
-            style_ref = gr.File(label="风格参考图（可多张拖入，每张一个画风）",
-                               file_count="multiple", file_types=["image"],
-                               type="filepath")
+            style_ref = gr.File(
+                label="风格参考图（可多张拖入）",
+                file_count="multiple", file_types=["image"],
+                type="filepath")
             char_ref = gr.Image(label="角色参考图（可选）", type="filepath")
             duration = gr.Slider(5, 120, value=10, step=5,
                                  label="视频时长（秒）")
-            generate_btn = gr.Button("生成", variant="primary", size="lg")
+
+            with gr.Row():
+                plan_btn = gr.Button("① 开始规划", variant="primary", size="lg")
+                gen_btn = gr.Button("② 生成视频", variant="primary", size="lg",
+                                    interactive=False)
+                compose_btn = gr.Button("③ 拼接输出", variant="primary", size="lg",
+                                        interactive=False)
+            reset_btn = gr.Button("⟳ 重置", variant="secondary", size="sm")
 
         with gr.Column(scale=1):
             storyboard_out = gr.JSON(label="分镜表")
             video_out = gr.Video(label="生成的视频")
-            log_out = gr.Textbox(label="执行日志", lines=15, max_lines=30,
+            log_out = gr.Textbox(label="执行日志", lines=12, max_lines=25,
                                  autoscroll=True)
 
-    generate_btn.click(
-        fn=handle_generate,
-        inputs=[text_input, style_ref, char_ref, duration],
-        outputs=[storyboard_out, video_out, log_out],
+    # ── Hidden session state ──
+    session_state = gr.State(None)
+
+    # ── Wire buttons ──
+    plan_btn.click(
+        fn=handle_planning,
+        inputs=[text_input, style_ref, char_ref, duration, session_state],
+        outputs=[storyboard_out, video_out, log_out, session_state, gen_btn],
+    )
+
+    gen_btn.click(
+        fn=handle_generation,
+        inputs=[session_state],
+        outputs=[storyboard_out, video_out, log_out, session_state, compose_btn],
+    )
+
+    compose_btn.click(
+        fn=handle_composition,
+        inputs=[session_state],
+        outputs=[storyboard_out, video_out, log_out, session_state],
+    )
+
+    reset_btn.click(
+        fn=handle_reset,
+        inputs=[],
+        outputs=[storyboard_out, video_out, log_out, session_state,
+                 gen_btn, compose_btn],
     )
 
 
