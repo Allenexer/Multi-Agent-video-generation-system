@@ -98,17 +98,32 @@ agents:
     prompt: |
       你是一个视觉风格分析专家 Agent（StyleAnalyzer）。
 
-      收到参考图片后：
-      1. 仔细观察图片的视觉风格：色彩、光影、线条、笔触、构图、氛围
-      2. 提取可用于 Stable Diffusion / AnimateDiff 的风格描述
-      3. 输出结构化的风格参数
+      你会收到多张参考图片。系统传入的图片列表中，所有类型为"风格参考图"的图片
+      按 label 中的 index 排序（风格参考0、风格参考1...）。你需要为每一张风格参考图
+      分别生成独立的风格描述，以便后续按 style_index 精确注入对应镜头。
 
-      风格参数需要在多个镜头间保持一致，描述要足够精确和可复现。
+      步骤：
+      1. 遍历所有图片，识别哪些是风格参考图
+      2. 为每张风格参考图单独分析：色彩、光影、线条、笔触、构图、氛围
+      3. 输出 style_fragments 数组（每张风格参考图一个条目）
+      4. 同时输出一个全局 style_prompt_fragment 作为单风格回退
 
       输出 JSON（严格遵循）：
       {
-        "style_summary": "一句话风格概括",
-        "style_prompt_fragment": "英文 prompt 片段，直接拼接到 SD prompt 中",
+        "style_summary": "一句话风格概括（所有风格图的综合描述）",
+        "style_fragments": [
+          {
+            "index": 0,
+            "style_prompt_fragment": "英文 prompt 片段，描述第0张风格参考图的视觉风格，可直接拼接到生成 prompt 中",
+            "keywords": ["此风格的核心视觉关键词"]
+          },
+          {
+            "index": 1,
+            "style_prompt_fragment": "英文 prompt 片段，描述第1张风格参考图的视觉风格",
+            "keywords": ["此风格的核心视觉关键词"]
+          }
+        ],
+        "style_prompt_fragment": "全局回退风格描述（所有图共性的英文 prompt 片段）",
         "negative_prompt_fragment": "需要避免的风格元素",
         "technical_params": {
           "cfg_scale": 7.5,
@@ -118,6 +133,8 @@ agents:
       }
 
       字段约束：
+        style_fragments      — 数组，每张风格参考图一个条目，index 从 0 开始递增
+        style_prompt_fragment — 单风格回退值，当 pipeline 无法匹配 style_index 时使用
         cfg_scale             — number, 建议范围 5.0-12.0
         ip_adapter_strength   — number, 建议范围 0.3-1.0
         motion_scale_recommendation — number, 建议范围 0.2-1.0
@@ -247,7 +264,7 @@ agents:
         * 角色出场镜头（characters_in_shot 非空）：每角色 ≥ 3s，多角色场景 ≥ 5s
         * 空镜/过渡镜头（characters_in_shot 为空）：1-2s 即可
         * 高潮/关键情节镜头：5-10s
-        * 所有镜头 duration_sec 总和应接近上游 ScriptWriter 的 total_duration_sec
+        * 所有镜头 duration_sec 总和必须严格等于 total_duration_sec（误差不超过 1 秒）
       - 风格继承：每个镜头继承对应 scene 的 style_index（来自 ScriptWriter）
         * 同一 scene 下的镜头共用相同的 style_index
       - 转场镜头：风格切换时插入转场镜头（1-2s）
@@ -294,7 +311,7 @@ agents:
             "prompt": "英文生成 prompt（风格片段+角色外观+景别+运镜+光线+构图+氛围+画面内容+cinematic lighting, 8K, highly detailed）",
             "negative_prompt": "负面 prompt",
             "generation_params": {
-              "model": "animatediff_v3",
+              "model": "cogvideox-3",
               "frames": 72,
               "motion_scale": 0.5
             }
@@ -308,7 +325,7 @@ agents:
         shot_id     — 从 1 开始的整数
         shot_type   — 仅可选: extreme_wide | wide | medium | medium_close_up | close_up
         camera      — 仅可选: static | tracking | slow_push_in | slow_pull_back
-        model       — 固定值: animatediff_v3
+        model       — 固定值: cogvideox-3
         frames      — 整数，fps × duration_sec = frames（fps 默认 24）
         motion_scale — number, 0.0-1.0，慢速镜头用 0.3-0.5，快速动作用 0.6-0.9
         characters_in_shot — array, char_id列表。无角色时填 []
@@ -338,7 +355,7 @@ agents:
       输出 JSON（严格遵循）：
       {
         "shot_id": 1,
-        "model": "animatediff_v3",
+        "model": "cogvideox-3",
         "candidates": [
           {
             "index": 0,

@@ -43,6 +43,23 @@ DEFAULT_MAX_RETRIES = 3
 BASE_OUTPUT = "outputs"
 
 
+def _prompt_contains(longer: str, fragment: str, threshold: float = 0.4) -> bool:
+    """Check if `longer` already covers a significant portion of `fragment`.
+
+    Used to avoid prepending style/character fragments that the shot prompt
+    already describes. Returns True if enough words from fragment appear in longer.
+    """
+    if not fragment or not longer:
+        return False
+    frag_words = set(w.lower().strip(",.;:!?") for w in fragment.split()
+                     if len(w) > 3)
+    if not frag_words:
+        return False
+    long_words = longer.lower().split()
+    overlap = sum(1 for w in frag_words if w in long_words)
+    return (overlap / len(frag_words)) >= threshold
+
+
 @dataclass
 class PipelineSession:
     """State object passed between stepped pipeline phases.
@@ -198,17 +215,39 @@ class PipelineExecutor:
 
             # ── Build unified prompt (text-level style + character + shot) ──
             base_prompt = shot.get("prompt", "")
-            style_idx = shot.get("style_index") or 0
+            chars_in_shot = shot.get("characters_in_shot") or []
+            style_idx = shot.get("style_index")
+
+            # Resolve per-shot style fragment
             style_fragments = anchors.get("style_fragments", [])
-            if style_fragments and 0 <= style_idx < len(style_fragments):
+            if style_fragments and style_idx is not None and 0 <= style_idx < len(style_fragments):
                 style_part = style_fragments[style_idx]
             else:
                 style_part = anchors.get("style_fragment", "")
             char_part = anchors.get("character_fragment", "")
-            unified_prompt = (
-                f"{style_part}, {char_part}, {base_prompt}".strip(", "))
 
-            _log(f"[Shot {sid}] prompt: {unified_prompt[:120]}...")
+            # ── Conditional concatenation ──
+            # - Transition shots (no characters, no style_index) → base only
+            # - Shots with characters but base already describes them → skip char
+            # - Shots with style but base already describes it → skip style
+            parts = []
+
+            # Style: skip if style_index is null (transition) or base already contains it
+            if style_idx is not None and style_part:
+                if not _prompt_contains(base_prompt, style_part):
+                    parts.append(style_part)
+
+            # Character: skip if no characters in shot or base already contains it
+            if chars_in_shot and char_part:
+                if not _prompt_contains(base_prompt, char_part):
+                    parts.append(char_part)
+
+            parts.append(base_prompt)
+            unified_prompt = ", ".join(parts)
+
+            _log(f"[Shot {sid}] style_idx={style_idx}"
+                 f" chars={chars_in_shot}"
+                 f" prompt: {unified_prompt[:120]}...")
 
             had_reset = (anchor_frame is None)
             result = None
