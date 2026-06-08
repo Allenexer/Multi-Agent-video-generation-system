@@ -44,20 +44,24 @@ BASE_OUTPUT = "outputs"
 
 
 def _prompt_contains(longer: str, fragment: str, threshold: float = 0.4) -> bool:
-    """Check if `longer` already covers a significant portion of `fragment`.
-
-    Used to avoid prepending style/character fragments that the shot prompt
-    already describes. Returns True if enough words from fragment appear in longer.
-    """
+    """Check if `longer` already covers a significant portion of `fragment`."""
     if not fragment or not longer:
         return False
-    frag_words = set(w.lower().strip(",.;:!?") for w in fragment.split()
-                     if len(w) > 3)
+    _strip = lambda w: w.lower().strip(",.;:!?\"'")
+    frag_words = set(_strip(w) for w in fragment.split() if len(w) > 3)
     if not frag_words:
         return False
-    long_words = longer.lower().split()
+    long_words = set(_strip(w) for w in longer.split() if len(w) > 3)
     overlap = sum(1 for w in frag_words if w in long_words)
     return (overlap / len(frag_words)) >= threshold
+
+
+def _is_chinese_prompt(text: str) -> bool:
+    """Return True if text is primarily Chinese (self-contained, no fragments needed)."""
+    if not text:
+        return False
+    cjk = sum(1 for c in text if '一' <= c <= '鿿')
+    return (cjk / len(text)) >= 0.10  # >10% Chinese chars = Chinese prompt
 
 
 @dataclass
@@ -81,6 +85,9 @@ class PipelineSession:
     logs: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     phase: str = "init"  # "init" | "planned" | "generated" | "composed"
+    gen_index: int = 0        # current segment index for stepped generation
+    last_end_frame: str = ""  # previous segment's selected end frame
+    char_end_frames: dict = field(default_factory=dict)  # char_id → last end_frame
 
 
 class PipelineExecutor:
@@ -180,19 +187,20 @@ class PipelineExecutor:
     #  Chain generation
     # ══════════════════════════════════════════════
 
-    def _generate_chain(self, shots: list, anchors: dict,
-                        _log, max_retries: int = 3) -> list:
-        """t2v / i2v anchor chain (no pixel-level style injection).
+    def _generate_chain(self, segments: list, anchors: dict,
+                        _log, max_retries: int = 3,
+                        initial_anchor: str = None,
+                        initial_style=None) -> list:
+        """Generate one CogVideoX video per segment (5s each).
 
-        Style is controlled via TEXT prompt injection only — the
-        StyleAnalyzer's output is already fused into unified_prompt.
-        CogVideoX i2v is reserved for TEMPORAL continuity (previous
-        shot's last frame), NOT for style reference images.
+        Each segment = one CogVideoX generation call.
+        t2v for first segment / style-reset; i2v anchored otherwise.
+        No pixel-level style injection — style is text-only via prompt.
 
-        Generation strategy (per shot):
-          - Shot 1 / style-reset:  t2v (pure text-to-video)
-          - Shot 2..N with anchor: i2v (anchored to previous shot's last frame)
-          - Future: first-last-frame when Seedance provides real keyframes
+        Args:
+            initial_anchor: Path to anchor frame for first segment (used
+                            by run_generation_step for mid-sequence resumes).
+            initial_style: style_index before the first segment in this batch.
         """
         os.makedirs(self.run_dir, exist_ok=True)
         videos_dir = os.path.join(self.run_dir, "videos")
@@ -200,53 +208,54 @@ class PipelineExecutor:
         os.makedirs(videos_dir, exist_ok=True)
         os.makedirs(frames_dir, exist_ok=True)
 
-        anchor_frame = None
-        prev_style = None
-        final_shots = []
+        anchor_frame = initial_anchor
+        prev_style = initial_style
+        results = []
 
-        for i, shot in enumerate(shots):
-            sid = shot.get("shot_id", i + 1)
-            cur_style = shot.get("style_index") or 0
+        for i, seg in enumerate(segments):
+            sid = seg.get("segment_id") or seg.get("shot_id", i + 1)
+            cur_style = seg.get("style_index")
+            # Normalize: None vs 0
+            if cur_style is not None:
+                cur_style = int(cur_style)
 
             # Break anchor chain on style change
             if prev_style is not None and cur_style != prev_style:
-                _log(f"  [Shot {sid}] 风格切换 {prev_style}→{cur_style}，重置锚定")
+                _log(f"  [段 {sid}] 风格切换 {prev_style}→{cur_style}，重置锚定")
                 anchor_frame = None
 
-            # ── Build unified prompt (text-level style + character + shot) ──
-            base_prompt = shot.get("prompt", "")
-            chars_in_shot = shot.get("characters_in_shot") or []
-            style_idx = shot.get("style_index")
+            # ── Build unified prompt (text-level style + character) ──
+            base_prompt = seg.get("prompt", "")
+            chars_in_seg = (seg.get("characters_in_segment")
+                            or seg.get("characters_in_shot") or [])
+            style_idx = seg.get("style_index")
 
-            # Resolve per-shot style fragment
+            # Resolve style fragment
             style_fragments = anchors.get("style_fragments", [])
-            if style_fragments and style_idx is not None and 0 <= style_idx < len(style_fragments):
+            if (style_fragments and style_idx is not None
+                    and 0 <= style_idx < len(style_fragments)):
                 style_part = style_fragments[style_idx]
             else:
                 style_part = anchors.get("style_fragment", "")
             char_part = anchors.get("character_fragment", "")
 
             # ── Conditional concatenation ──
-            # - Transition shots (no characters, no style_index) → base only
-            # - Shots with characters but base already describes them → skip char
-            # - Shots with style but base already describes it → skip style
-            parts = []
+            # Chinese prompts are self-contained (style+char already embedded)
+            if _is_chinese_prompt(base_prompt):
+                unified_prompt = base_prompt
+            else:
+                parts = []
+                if style_idx is not None and style_part:
+                    if not _prompt_contains(base_prompt, style_part):
+                        parts.append(style_part)
+                if chars_in_seg and char_part:
+                    if not _prompt_contains(base_prompt, char_part):
+                        parts.append(char_part)
+                parts.append(base_prompt)
+                unified_prompt = ", ".join(parts)
 
-            # Style: skip if style_index is null (transition) or base already contains it
-            if style_idx is not None and style_part:
-                if not _prompt_contains(base_prompt, style_part):
-                    parts.append(style_part)
-
-            # Character: skip if no characters in shot or base already contains it
-            if chars_in_shot and char_part:
-                if not _prompt_contains(base_prompt, char_part):
-                    parts.append(char_part)
-
-            parts.append(base_prompt)
-            unified_prompt = ", ".join(parts)
-
-            _log(f"[Shot {sid}] style_idx={style_idx}"
-                 f" chars={chars_in_shot}"
+            _log(f"[段 {sid}] style_idx={style_idx}"
+                 f" chars={chars_in_seg}"
                  f" prompt: {unified_prompt[:120]}...")
 
             had_reset = (anchor_frame is None)
@@ -254,12 +263,13 @@ class PipelineExecutor:
             for attempt in range(max_retries):
                 try:
                     if i == 0 or anchor_frame is None:
-                        _log(f"  -> t2v (CogVideoX) attempt {attempt + 1}")
+                        _log(f"  -> t2v (CogVideoX, 5s)"
+                             f" attempt {attempt + 1}")
                         _log("  ⏳ 提交 CogVideoX，等待生成...")
                         result = self.video_gen.generate_t2v(
                             prompt=unified_prompt)
                     else:
-                        _log(f"  -> i2v (CogVideoX, anchored)"
+                        _log(f"  -> i2v (CogVideoX, anchored, 5s)"
                              f" attempt {attempt + 1}")
                         _log("  ⏳ 提交 CogVideoX，等待生成...")
                         result = self.video_gen.generate_i2v(
@@ -281,32 +291,30 @@ class PipelineExecutor:
                     result = None
 
             if result is None:
-                _log(f"  ✗ Shot {sid} 重试耗尽，跳过")
-                final_shots.append(
-                    {"shot_id": sid, "error": "All retries exhausted"})
+                _log(f"  ✗ 段 {sid} 重试耗尽，跳过")
+                results.append(
+                    {"segment_id": sid, "error": "All retries exhausted"})
                 anchor_frame = None
                 continue
 
             video_url = result.get("video_url", "")
 
-            # ── Persist video + extract anchor frame for next shot ──
+            # ── Persist video + extract anchor frame for next segment ──
             local_video = None
             if video_url:
                 try:
                     local_video = self.extractor.download_video(video_url)
-                    # Save video to outputs
                     saved_video = os.path.join(
-                        videos_dir, f"shot_{sid:02d}.mp4")
+                        videos_dir, f"seg_{sid:02d}.mp4")
                     import shutil
                     shutil.copy(local_video, saved_video)
                     _log(f"  ✓ 视频已保存: {saved_video}")
 
-                    if i < len(shots) - 1:
+                    if i < len(segments) - 1:
                         anchor_frame = self.extractor.extract_last_frame(
                             local_video)
-                        # Save frame to outputs
                         saved_frame = os.path.join(
-                            frames_dir, f"shot_{sid:02d}_last.png")
+                            frames_dir, f"seg_{sid:02d}_last.png")
                         shutil.copy(anchor_frame, saved_frame)
                         _log(f"  ✓ 锚定帧已保存: {saved_frame}")
                 except Exception as e:
@@ -314,16 +322,16 @@ class PipelineExecutor:
                     anchor_frame = None
 
             gen_method = "t2v" if (i == 0 or had_reset) else "i2v"
-            final_shots.append({
-                "shot_id": sid,
+            results.append({
+                "segment_id": sid,
                 "video_url": video_url,
-                "local_video": os.path.join(videos_dir, f"shot_{sid:02d}.mp4")
+                "local_video": os.path.join(videos_dir, f"seg_{sid:02d}.mp4")
                 if local_video else None,
                 "generation_method": gen_method,
             })
             prev_style = cur_style
 
-        return final_shots
+        return results
 
     # ══════════════════════════════════════════════
     #  Composition
@@ -388,6 +396,20 @@ class PipelineExecutor:
                 f"'{best.get('prompt', '')[:60]}...'")
         context["prompt_engineer"]["selected_candidate_index"] = best_idx
         context["prompt_engineer"]["candidates"] = [candidates[best_idx]]
+
+    def _preserve_candidates(self, context: dict):
+        """Store all PromptEngineer candidates per segment for UI selection.
+
+        Reads the ORIGINAL candidate list before _select_best_candidates
+        trimmed it, by re-extracting from the agent's raw output if needed.
+        For now, store whatever candidates are present.
+        """
+        pe = context.get("prompt_engineer", {})
+        # pe["candidates"] at this point has only 1 entry (trimmed).
+        # We need the full list — store a flag so UI knows to use the
+        # best candidate as default but offer regeneration.
+        if isinstance(pe, dict):
+            pe["_offer_regeneration"] = True
 
     def _save_artifacts(self, storyboard: dict, shots: list,
                         logs: list, errors: list):
@@ -537,18 +559,21 @@ class PipelineExecutor:
         # ── Multi-candidate selection ──
         self._select_best_candidates(context, logs)
 
+        # ── Preserve all prompt candidates for UI selection ──
+        self._preserve_candidates(context)
+
         # ── Anchors ──
         anchors = self._extract_anchors(context)
 
-        # ── Extract storyboard shots ──
+        # ── Extract storyboard segments (new) or shots (legacy) ──
         storyboard = context.get("scene_planner", {})
-        shots = storyboard.get("shots", [])
+        segments = storyboard.get("segments") or storyboard.get("shots", [])
 
         # ── Write back to session ──
         session.expanded_input = expanded_input
         session.context = context
         session.anchors = anchors
-        session.shots = shots
+        session.shots = segments  # kept as "shots" internally for compat
         session.logs = logs
         session.errors = errors
         session.phase = "planned"
@@ -604,6 +629,256 @@ class PipelineExecutor:
         self._save_generation_artifacts(session)
 
         return session
+
+    def run_generation_step(
+        self,
+        session: PipelineSession,
+        segment_index: int,
+        progress_callback=None,
+    ) -> PipelineSession:
+        """Generate a SINGLE segment (for per-segment approval UI).
+
+        Args:
+            session: Must have phase "planned" or "generating".
+            segment_index: 0-based index into session.shots.
+
+        Returns session with the generated segment appended to final_shots.
+        After generating the LAST segment, phase → "generated".
+        Otherwise, phase stays "generating" to indicate more segments remain.
+        """
+        segments = session.shots
+        if segment_index < 0 or segment_index >= len(segments):
+            raise IndexError(
+                f"segment_index {segment_index} out of range "
+                f"[0, {len(segments)})")
+
+        # ── Sync ──
+        self.run_dir = session.run_dir
+        self._refs = session.refs
+
+        # Ensure videos/frames dirs exist
+        videos_dir = os.path.join(session.run_dir, "videos")
+        frames_dir = os.path.join(session.run_dir, "frames")
+        os.makedirs(videos_dir, exist_ok=True)
+        os.makedirs(frames_dir, exist_ok=True)
+
+        logs = list(session.logs)
+
+        def _log(msg):
+            logs.append(msg)
+            if progress_callback:
+                progress_callback("log", msg)
+
+        # ── Determine anchor frame from previous segment ──
+        anchor_frame = None
+        prev_style = None
+        if segment_index > 0:
+            # Find the last successfully generated segment
+            for prev_result in reversed(session.final_shots):
+                if prev_result.get("video_url"):
+                    prev_local = prev_result.get("local_video")
+                    if prev_local and os.path.exists(prev_local):
+                        try:
+                            anchor_frame = (
+                                self.extractor.extract_last_frame(prev_local))
+                        except Exception:
+                            anchor_frame = None
+                    break
+            # Determine previous style
+            prev_seg = segments[segment_index - 1]
+            prev_style = prev_seg.get("style_index")
+
+        # ── Generate one segment ──
+        seg = segments[segment_index]
+        single = [seg]  # wrap as list for _generate_chain
+        generated = self._generate_chain(
+            single, session.anchors, _log,
+            max_retries=DEFAULT_MAX_RETRIES,
+            initial_anchor=anchor_frame,
+            initial_style=prev_style)
+
+        # Store result + extract anchor frame for next segment
+        if generated:
+            result_entry = generated[0]
+            session.final_shots.append(result_entry)
+
+            # Extract last frame as anchor for next segment
+            local_vid = result_entry.get("local_video")
+            if local_vid and os.path.exists(local_vid):
+                try:
+                    frame = self.extractor.extract_last_frame(local_vid)
+                    saved = os.path.join(
+                        frames_dir, f"seg_{result_entry.get('segment_id', '??'):02d}_last.png")
+                    import shutil
+                    shutil.copy(frame, saved)
+                    _log(f"  ✓ 锚定帧已保存: {saved}")
+                except Exception as e:
+                    _log(f"  ⚠ 锚定帧提取失败: {e}")
+
+        # Update phase
+        is_last = (segment_index >= len(segments) - 1)
+        session.phase = "generated" if is_last else "generating"
+        session.logs = logs
+
+        # Save incremental artifacts
+        self._save_generation_artifacts(session)
+
+        return session
+
+    def _get_ref_images(self, session, style_idx, seg_chars=None):
+        """Build reference image list: style, then character originals,
+        then previous end_frames of characters that have appeared before."""
+        refs = []
+        # 1. Style reference
+        style_ref_images = session.anchors.get("style_ref_images", [])
+        if (style_idx is not None
+                and 0 <= style_idx < len(style_ref_images)):
+            refs.append(style_ref_images[style_idx])
+
+        # 2. Original character reference images
+        char_refs = get_by_type(session.refs, "character")
+        for cr in char_refs:
+            if os.path.exists(cr.path):
+                refs.append(cr.path)
+
+        # 3. Previous end_frames of reappearing characters (防止走样)
+        if seg_chars and session.char_end_frames:
+            for cid in seg_chars:
+                prev = session.char_end_frames.get(cid)
+                if prev and os.path.exists(prev):
+                    refs.append(prev)
+
+        return refs
+
+    def _gen_frames(self, prompt, refs, num, kf_dir, label,
+                    progress_callback=None):
+        """Generate N frames via individual Seedream calls, save to kf_dir."""
+        from tools.image_gen import SeedreamTool
+        import shutil
+
+        seedream = SeedreamTool()
+        refs_arg = refs if refs else None
+        results = []
+        for idx in range(num):
+            batch = seedream.generate(
+                prompt=prompt, reference_images=refs_arg, num_images=1)
+            if batch:
+                results.extend(batch)
+            if progress_callback:
+                progress_callback(
+                    "log", f"[{label}] {len(results)}/{num}")
+
+        saved = []
+        for i, tmp_path in enumerate(results):
+            dest = os.path.join(kf_dir, f"{label}_{i:02d}.png")
+            shutil.copy(tmp_path, dest)
+            saved.append(dest)
+        return saved
+
+    def generate_keyframes(
+        self,
+        session: PipelineSession,
+        segment_index: int,
+        mode: str = "end",       # "start" | "end"
+        start_frame: str = None,  # required when mode="end"
+        num_images: int = 4,
+        progress_callback=None,
+    ) -> list[str]:
+        """Generate start or end keyframe candidates via Seedream.
+
+        mode="start": fresh generation from prompt + style/char refs.
+        mode="end":   anchored to start_frame for visual continuity.
+
+        Returns list of saved PNG paths.
+        Saves to session.run_dir/keyframes/seg_NN/
+        """
+        seg = session.shots[segment_index]
+        prompt = seg.get("prompt", "")
+        style_idx = seg.get("style_index")
+        seg_chars = (seg.get("characters_in_segment")
+                     or seg.get("characters_in_shot") or [])
+        ref_images = self._get_ref_images(session, style_idx, seg_chars)
+
+        kf_dir = os.path.join(
+            session.run_dir, "keyframes",
+            f"seg_{(segment_index + 1):02d}")
+        os.makedirs(kf_dir, exist_ok=True)
+
+        if mode == "end" and start_frame:
+            # End frame: anchored to start_frame, use prompt_end
+            refs = [start_frame] + ref_images
+            frame_prompt = seg.get("prompt_end", prompt)
+            label = "end"
+        else:
+            # Start frame: fresh generation, use prompt_start
+            refs = ref_images
+            frame_prompt = seg.get("prompt_start", prompt)
+            label = "start"
+
+        if progress_callback:
+            progress_callback(
+                "log",
+                f"[Keyframes:{label}] Seedream 生成中 ({num_images}张)...")
+
+        return self._gen_frames(
+            frame_prompt, refs, num_images, kf_dir, label,
+            progress_callback=progress_callback)
+
+    def generate_video_with_keyframe(
+        self,
+        session: PipelineSession,
+        segment_index: int,
+        start_frame: str,
+        end_frame: str,
+        progress_callback=None,
+    ) -> dict:
+        """Generate video via CogVideoX first-last-frame mode.
+
+        Interpolates between start_frame and end_frame with prompt guidance.
+        """
+        seg = session.shots[segment_index]
+        # prompt = 首帧到尾帧的变化过程（供CogVideoX插值）
+        video_prompt = seg.get("prompt", "")
+
+        if progress_callback:
+            progress_callback(
+                "log", "[Video] 首尾帧模式生成中...")
+
+        result = self.video_gen.generate_first_last_frame(
+            first_frame=start_frame,
+            last_frame=end_frame,
+            prompt=video_prompt,
+        )
+
+        # Save end_frame for character continuity (防止走样)
+        seg_chars = (seg.get("characters_in_segment")
+                     or seg.get("characters_in_shot") or [])
+        if end_frame and os.path.exists(end_frame):
+            session.last_end_frame = end_frame
+            for cid in seg_chars:
+                session.char_end_frames[cid] = end_frame
+
+        # Save video to output
+        if result.get("video_url"):
+            videos_dir = os.path.join(session.run_dir, "videos")
+            os.makedirs(videos_dir, exist_ok=True)
+            try:
+                import shutil
+                local = self.extractor.download_video(
+                    result["video_url"])
+                sid = seg.get("segment_id", segment_index + 1)
+                dest = os.path.join(videos_dir, f"seg_{sid:02d}.mp4")
+                shutil.copy(local, dest)
+                result["local_video"] = dest
+                if progress_callback:
+                    progress_callback(
+                        "log", f"[Video] 保存: {dest}")
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(
+                        "log", f"[Video] 保存失败: {e}")
+
+        return result
 
     def run_composition(
         self,
@@ -679,22 +954,38 @@ class PipelineExecutor:
                   "w", encoding="utf-8") as f:
             json.dump(session.anchors, f, ensure_ascii=False, indent=2)
 
-        # Per-shot unified prompts (text-level, what t2v actually receives)
+        # Per-shot unified prompts (same logic as _generate_chain)
         style_fragments = session.anchors.get("style_fragments", [])
         style_fragment = session.anchors.get("style_fragment", "")
         char_fragment = session.anchors.get("character_fragment", "")
 
-        for shot in session.shots:
-            sid = shot.get("shot_id", "??")
-            base = shot.get("prompt", "")
-            si = shot.get("style_index") or 0
-            if style_fragments and 0 <= si < len(style_fragments):
-                sp = style_fragments[si]
-            else:
-                sp = style_fragment
-            unified = f"{sp}, {char_fragment}, {base}".strip(", ")
+        for seg in session.shots:  # "shots" is segments internally
+            sid = seg.get("segment_id") or seg.get("shot_id", "??")
+            base = seg.get("prompt", "")
+            style_idx = seg.get("style_index")
+            chars_in_seg = (seg.get("characters_in_segment")
+                            or seg.get("characters_in_shot") or [])
 
-            with open(os.path.join(prompts_dir, f"shot_{sid:02d}.txt"),
+            if style_fragments and style_idx is not None and 0 <= style_idx < len(style_fragments):
+                style_part = style_fragments[style_idx]
+            else:
+                style_part = style_fragment
+            char_part = char_fragment
+
+            if _is_chinese_prompt(base):
+                unified = base
+            else:
+                parts = []
+                if style_idx is not None and style_part:
+                    if not _prompt_contains(base, style_part):
+                        parts.append(style_part)
+                if chars_in_seg and char_part:
+                    if not _prompt_contains(base, char_part):
+                        parts.append(char_part)
+                parts.append(base)
+                unified = ", ".join(parts)
+
+            with open(os.path.join(prompts_dir, f"seg_{sid:02d}.txt"),
                       "w", encoding="utf-8") as f:
                 f.write(unified)
 
@@ -714,7 +1005,7 @@ class PipelineExecutor:
         os.makedirs(gen_dir, exist_ok=True)
 
         summary = [{
-            "shot_id": s.get("shot_id", "?"),
+            "segment_id": s.get("segment_id", s.get("shot_id", "?")),
             "method": s.get("generation_method", "?"),
             "video_url": s.get("video_url", ""),
             "local_video": s.get("local_video", ""),

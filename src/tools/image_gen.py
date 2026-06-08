@@ -69,21 +69,13 @@ class SeedreamTool:
         extra_body = {"watermark": SEEDREAM_WATERMARK}
 
         # ── Reference images ──
+        # API field is "image" (not "reference_images")
         if reference_images:
             encoded = [self._encode(p) for p in reference_images]
-            # Single ref → string; multi ref → list
-            extra_body["reference_images"] = (
+            extra_body["image"] = (
                 encoded[0] if len(encoded) == 1 else encoded
             )
-
-        # ── Sequential / group mode ──
-        if num_images > 1:
-            extra_body["sequential_image_generation"] = "auto"
-            extra_body["sequential_image_generation_options"] = {
-                "max_images": num_images,
-            }
-        else:
-            extra_body["sequential_image_generation"] = "disabled"
+        # Always single-image mode (group mode unreliable with base64)
 
         return self._generate_and_collect(prompt, size, extra_body)
 
@@ -198,11 +190,10 @@ class SeedreamTool:
                 extra_body=extra_body,
             )
             for event in response:
-                if (
-                    event
-                    and event.type == "image_generation.partial_succeeded"
-                ):
-                    if event.b64_json:
+                if event is None:
+                    continue
+                if event.type == "image_generation.partial_succeeded":
+                    if event.b64_json is not None:
                         frames_b64.append(event.b64_json)
         except Exception:
             return []
