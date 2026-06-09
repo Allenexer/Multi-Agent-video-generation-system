@@ -807,7 +807,23 @@ class PipelineExecutor:
         if mode == "end" and start_frame:
             # End frame: anchored to start_frame, use prompt_end
             refs = [start_frame] + ref_images
-            frame_prompt = seg.get("prompt_end", prompt)
+            frame_prompt = (
+                f"SCENE CONTINUITY RULE: All static scene elements must "
+                f"remain identical to the reference image in position, "
+                f"shape, scale, and existence — including spatial "
+                f"relationships between objects, distances from boundaries, "
+                f"relative layout. Change is only allowed when explicitly "
+                f"caused by camera movement named in the prompt. "
+                f"If no camera movement is specified, the background must "
+                f"be pixel-identical to the reference. "
+                f"ALLOWED changes: foreground subject pose/expression, "
+                f"explicitly requested props/effects. "
+                f"FORBIDDEN: any static object shifting position; any "
+                f"object appearing or disappearing; any change to spatial "
+                f"relationships or boundary distances; any change to "
+                f"lighting direction, color, or quality that is not "
+                f"explicitly requested. "
+                f"Scene: {seg.get('prompt_end', prompt)}")
             label = "end"
         else:
             # Start frame: fresh generation, use prompt_start

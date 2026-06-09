@@ -45,6 +45,23 @@ class Provider:
             return self.models[0].id
         raise ValueError(f"No models configured for provider '{self.id}'")
 
+    def find_free_model(self, model_type: str = "text") -> str | None:
+        """Pick a low-cost model of given type if available.
+        Heuristic: model id contains 'flash'/'free'/'mini'/'lite',
+        or description contains '免费'/'free'.
+        """
+        keywords_id = ("flash", "free", "mini", "lite")
+        keywords_desc = ("免费", "free")
+        for m in self.models:
+            if model_type and m.type != model_type:
+                continue
+            dl = (m.description or "").lower()
+            il = m.id.lower()
+            if any(k in dl for k in keywords_desc) or \
+               any(k in il for k in keywords_id):
+                return m.id
+        return None
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,

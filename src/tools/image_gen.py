@@ -17,7 +17,7 @@ import os
 import base64
 from openai import OpenAI
 
-SEEDREAM_MODEL = "doubao-seedream-4-5-251128"
+SEEDREAM_MODEL = "doubao-seedream-5-0-260128"
 SEEDREAM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 
 # ── Watermark policy ──

@@ -120,14 +120,35 @@ class ConfigManager:
         raise ValueError(f"No provider found for agent '{agent_id}' (model_type={model_type})")
 
     def get_model_for_agent(self, agent_id: str) -> str:
-        """Resolve which model an agent should use."""
+        """Resolve which model an agent should use.
+        Priority: user override → preferred model → free model fallback → default.
+        """
         override = self.agent_model_overrides.get(agent_id)
         if override:
             return override
         provider = self.get_provider_for_agent(agent_id)
         agent_cfg = self.agent_configs.get(agent_id, {})
         model_type = agent_cfg.get("model_type", "text")
+
+        preferred = agent_cfg.get("preferred_model")
+        if preferred and preferred in provider.get_model_ids():
+            return preferred
+
+        # Adaptive: cost-sensitive agents prefer a free model when available
+        if self._should_use_free_model(agent_id, agent_cfg):
+            free = provider.find_free_model(model_type)
+            if free:
+                return free
+
         return provider.get_default_model(model_type)
+
+    @staticmethod
+    def _should_use_free_model(agent_id: str, agent_cfg: dict) -> bool:
+        """Heuristic: critic-style or prefer_free_model agents downgrade."""
+        if agent_cfg.get("prefer_free_model"):
+            return True
+        aid_lc = (agent_id or "").lower()
+        return any(k in aid_lc for k in ("critic", "review", "judge"))
 
     def get_client_for_agent(self, agent_id: str):
         """Get an OpenAI client configured for the given agent."""
