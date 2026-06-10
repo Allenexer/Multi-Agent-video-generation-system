@@ -8,6 +8,7 @@ Three tabs:
 
 Launch: python app.py
 """
+import os
 import queue
 import threading
 import gradio as gr
@@ -29,7 +30,12 @@ def _normalize_images(style_refs, char_ref):
         style_images = [style_refs]
     else:
         style_images = [f for f in style_refs if f is not None]
-    char_images = [char_ref] if char_ref is not None else []
+    if char_ref is None:
+        char_images = []
+    elif isinstance(char_ref, str):
+        char_images = [char_ref]
+    else:
+        char_images = [f for f in char_ref if f is not None]
     return style_images, char_images
 
 
@@ -125,10 +131,10 @@ def handle_planning(text_input, style_refs, char_ref, duration, session_state):
            gr.update(value=""), gr.update(interactive=False))
 
 
-# ── Step 2a: Start keyframe generation ──
+# ── Step 2: Start keyframe generation ──
 
 def handle_start_frames(session_state, prompt_text):
-    """Generate START keyframe candidates. Yields (logs, gallery, paths, end_btn, start_select)."""
+    """Generate START keyframe candidates. Yields (logs, gallery, paths, video_btn, start_select)."""
     if session_state is None:
         yield ("[提示] 请先完成规划。", None, [], gr.update(interactive=False), None)
         return
@@ -143,10 +149,10 @@ def handle_start_frames(session_state, prompt_text):
         seg["prompt"] = prompt_text.strip()
 
     display_logs = list(session_state.logs)
-    display_logs.append(f"⏳ Seedream 生成段{si+1}起始帧...")
+    display_logs.append(f"⏳ Seedream 生成段{si+1}起始帧 (切镜)...")
 
     thread, q = _run_in_thread(
-        executor.generate_keyframes, session_state, si, "start", None, 4)
+        executor.generate_keyframes, session_state, si, 4)
     yield ("\n".join(display_logs), None, [], gr.update(interactive=False), None)
 
     import time
@@ -169,81 +175,29 @@ def handle_start_frames(session_state, prompt_text):
            gr.update(interactive=False), None)
 
 
-# ── Step 2b: End keyframe generation ──
+# ── Step 3: Video via i2v ──
 
-def handle_end_frames(session_state, start_frame):
-    """Generate END keyframe candidates (anchored to start_frame).
-    Yields (logs, gallery, paths, video_btn, end_select)."""
+def handle_video_keyframe(session_state, start_frame):
+    """Generate video via i2v from start frame. Yields (logs, session, video, next_btn, compose_btn)."""
     if session_state is None or not start_frame:
-        yield ("[提示] 请先生成并选择起始帧。", None, [],
-               gr.update(interactive=False), None)
-        return
-
-    si = getattr(session_state, 'gen_index', 0)
-    seg = _current_seg(session_state)
-    if seg is None:
-        yield ("[提示] 当前段不存在。", None, [],
-               gr.update(interactive=False), None)
-        return
-
-    # Resolve start_frame path
-    sf = start_frame
-    if isinstance(start_frame, str) and "," in start_frame:
-        sf = start_frame.split(",")[0].strip()
-
-    display_logs = list(session_state.logs)
-    display_logs.append(f"⏳ Seedream 生成段{si+1}结束帧 (锚定起始帧)...")
-
-    thread, q = _run_in_thread(
-        executor.generate_keyframes, session_state, si, "end", sf, 4)
-    yield ("\n".join(display_logs), None, [],
-           gr.update(interactive=False), None)
-
-    import time
-    result = None
-    while thread.is_alive() or not q.empty():
-        result, _err = _drain_queue(q, display_logs)
-        if result is not None and isinstance(result, list) and result:
-            display_logs.append(f"✓ 已生成 {len(result)} 张候选结束帧")
-            yield ("\n".join(display_logs),
-                   gr.update(value=result, interactive=True), result,
-                   gr.update(interactive=True),
-                   result[0])
-            return
-        yield ("\n".join(display_logs), gr.update(value=None, interactive=False),
-               [], gr.update(interactive=False), None)
-        time.sleep(0.3)
-
-    _drain_queue(q, display_logs)
-    yield ("\n".join(display_logs), None, [],
-           gr.update(interactive=False), None)
-
-
-# ── Step 3: Video with start + end keyframes ──
-
-def handle_video_keyframe(session_state, start_frame, end_frame):
-    """Generate video from start+end keyframes via first-last-frame mode.
-    Yields (logs, session, video, next_btn, compose_btn)."""
-    if session_state is None or not start_frame or not end_frame:
-        yield ("[提示] 请先生成起始帧和结束帧。", session_state,
+        yield ("[提示] 请先生成起始帧。", session_state,
                None, gr.update(), gr.update(interactive=False))
         return
 
     si = getattr(session_state, 'gen_index', 0)
     segs = session_state.shots
     display_logs = list(session_state.logs)
-    display_logs.append(f"⏳ 首尾帧模式生成段 {si+1} 视频...")
+    display_logs.append(f"⏳ i2v 锚定链生成段 {si+1} 视频...")
 
-    # Resolve paths
-    def _resolve(p):
-        if isinstance(p, str) and "," in p:
-            return p.split(",")[0].strip()
-        return p
-    sf = _resolve(start_frame)
-    ef = _resolve(end_frame)
+    sf = start_frame
+    if isinstance(start_frame, str) and "," in start_frame:
+        sf = start_frame.split(",")[0].strip()
+
+    display_logs.append(f"[Debug] start_frame={sf}")
+    display_logs.append(f"[Debug] exists={os.path.exists(sf) if sf else 'None'}")
 
     thread, q = _run_in_thread(
-        executor.generate_video_with_keyframe, session_state, si, sf, ef)
+        executor.generate_video_with_keyframe, session_state, si, sf)
     yield ("\n".join(display_logs), session_state,
            None, gr.update(), gr.update(interactive=False))
 
@@ -256,18 +210,22 @@ def handle_video_keyframe(session_state, start_frame, end_frame):
             err = result.get("error")
             if video_path:
                 display_logs.append(f"✓ 段 {si+1} 视频生成完成")
-                # Save end_frame for next segment continuity
-                session_state.last_end_frame = ef
-                session_state.final_shots.append({
+                # Replace existing entry for this segment (supports regeneration)
+                seg_entry = {
                     "segment_id": si + 1,
                     "video_url": result.get("video_url", ""),
                     "local_video": video_path,
-                    "generation_method": "first_last_frame",
-                })
+                    "generation_method": "i2v_anchor",
+                }
+                # Remove old entry if present, then append
+                session_state.final_shots = [
+                    s for s in session_state.final_shots
+                    if s.get("segment_id") != si + 1]
+                session_state.final_shots.append(seg_entry)
                 session_state.logs = display_logs
-                next_idx = si + 1
-                is_last = (next_idx >= len(segs))
-                session_state.gen_index = next_idx
+                # Don't advance gen_index here — user may want to regenerate
+                is_last = (si + 1 >= len(segs))
+                session_state.gen_index = si  # stay on current segment
                 session_state.phase = "generated" if is_last else "generating"
 
                 if is_last:
@@ -279,7 +237,7 @@ def handle_video_keyframe(session_state, start_frame, end_frame):
                     yield ("\n".join(display_logs), session_state,
                            video_path,
                            gr.update(interactive=True,
-                                     value=f"▶ 下一段 ({next_idx+1}/{len(segs)})"),
+                                     value=f"✓ 完成，点▶进入下一段 ({si+2}/{len(segs)})"),
                            gr.update(interactive=False))
                 return
             elif err:
@@ -296,40 +254,43 @@ def handle_video_keyframe(session_state, start_frame, end_frame):
 # ── Step 4: Next segment trigger ──
 
 def handle_next_segment(session_state):
-    """Advance to next segment. Logic depends on shot_change flag:
-    - shot_change=true: regenerate start frame (char refs auto-applied)
-    - shot_change=false: inherit previous end_frame as start_frame
+    """Advance to next segment.
+    - shot_change=false + prev_end exists → auto-inherit as start, enable video
+    - shot_change=true → enable start_btn for Seedream generation
+    Returns (prompt, gallery, paths, select, start_btn, video_btn, compose_btn, next_btn).
     """
     if session_state is None:
         return (gr.update(), gr.update(value=None, interactive=False), [], None,
-                gr.update(value=None, interactive=False), [], None,
                 gr.update(interactive=False), gr.update(interactive=False),
-                gr.update(interactive=False), gr.update(interactive=False),
-                gr.update())
+                gr.update(interactive=False), gr.update())
 
+    # Advance to next segment (user confirmed current one)
+    session_state.gen_index = getattr(session_state, 'gen_index', 0) + 1
     seg = _current_seg(session_state)
-    prompt_val = seg.get("prompt", "") if seg else ""
-    shot_change = seg.get("shot_change", True) if seg else True
+    if seg is None:
+        # Already at last segment — nothing to advance to
+        return (gr.update(), gr.update(value=None, interactive=False), [], None,
+                gr.update(interactive=False), gr.update(interactive=False),
+                gr.update(interactive=True),  # compose ready
+                gr.update(interactive=False))
+    prompt_val = seg.get("prompt", "")
+    shot_change = seg.get("shot_change", False) if seg else False
     prev_end = getattr(session_state, 'last_end_frame', '')
 
     if not shot_change and prev_end:
-        # Continuity: directly inherit previous end_frame as start
+        # Continuity: auto-inherit prev video last frame, skip to video
         return (gr.update(value=prompt_val),
                 gr.update(value=[prev_end], interactive=True), [prev_end], prev_end,
-                gr.update(value=None, interactive=False), [], None,
-                gr.update(interactive=False),   # start_btn: already have
-                gr.update(interactive=True),    # end_btn: ready
+                gr.update(interactive=False),   # start_btn: not needed
+                gr.update(interactive=True),    # video_btn: ready
                 gr.update(interactive=False),
                 gr.update())
     else:
-        # Shot change: regenerate start frame
-        # (char_end_frames auto-injected by pipeline for consistency)
+        # Shot change: need fresh Seedream start frame
         return (gr.update(value=prompt_val),
                 gr.update(value=None, interactive=False), [], None,
-                gr.update(value=None, interactive=False), [], None,
-                gr.update(interactive=False),
                 gr.update(interactive=True),    # start_btn: generate
-                gr.update(interactive=False),   # end_btn: wait
+                gr.update(interactive=False),   # video_btn: wait
                 gr.update(interactive=False),
                 gr.update())
 
@@ -369,10 +330,9 @@ def handle_composition(session_state):
 def handle_reset():
     return ({}, None, "", None, gr.update(value=""),
             gr.update(value=None, interactive=False), [],
-            gr.update(value=None, interactive=False), [], None, None,
+            None,
             gr.update(interactive=False), gr.update(interactive=False),
-            gr.update(interactive=False), gr.update(interactive=False),
-            gr.update(interactive=False))
+            gr.update(interactive=False), gr.update(interactive=False))
 
 
 # ── Build UI ──
@@ -391,19 +351,20 @@ def build_generation_tab():
                 label="风格参考图（可多张拖入）",
                 file_count="multiple", file_types=["image"],
                 type="filepath")
-            char_ref = gr.Image(label="角色参考图（可选）", type="filepath")
+            char_ref = gr.File(
+                label="角色参考图（可多张拖入，顺序=角色0/1/2）",
+                file_count="multiple", file_types=["image"],
+                type="filepath")
             duration = gr.Slider(5, 120, value=10, step=5,
                                  label="视频时长（秒）")
 
             with gr.Row():
                 plan_btn = gr.Button("① 开始规划", variant="primary")
-                start_btn = gr.Button("②a 生成起始帧", variant="primary",
+                start_btn = gr.Button("② 生成起始帧（切镜时）", variant="primary",
                                       interactive=False)
-                end_btn = gr.Button("②b 生成结束帧", variant="primary",
-                                    interactive=False)
-            with gr.Row():
                 video_btn = gr.Button("③ 生成视频", variant="primary",
                                       interactive=False)
+            with gr.Row():
                 next_btn = gr.Button("▶ 下一段", variant="secondary",
                                      interactive=False)
                 compose_btn = gr.Button("④ 拼接输出", variant="primary",
@@ -415,19 +376,10 @@ def build_generation_tab():
             prompt_editor = gr.Textbox(
                 label="当前段 Prompt（可编辑）", lines=2,
                 placeholder="规划完成后显示...")
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**起始帧**")
-                    start_gallery = gr.Gallery(
-                        label="起始帧候选", columns=4, height=150,
-                        interactive=False, allow_preview=True,
-                        object_fit="contain")
-                with gr.Column():
-                    gr.Markdown("**结束帧**")
-                    end_gallery = gr.Gallery(
-                        label="结束帧候选", columns=4, height=150,
-                        interactive=False, allow_preview=True,
-                        object_fit="contain")
+            start_gallery = gr.Gallery(
+                label="起始帧候选（切镜时点击选择，连续段自动加载末帧）", columns=4, height=180,
+                interactive=False, allow_preview=True,
+                object_fit="contain")
             video_out = gr.Video(label="生成的视频")
             log_out = gr.Textbox(label="执行日志", lines=5, max_lines=15,
                                  autoscroll=True)
@@ -435,21 +387,13 @@ def build_generation_tab():
     # ── Hidden state ──
     session_state = gr.State(None)
     start_select = gr.State(None)
-    end_select = gr.State(None)
     start_paths = gr.State([])
-    end_paths = gr.State([])
 
-    # ── Gallery selection handlers ──
     def _on_start_select(evt: gr.SelectData, paths):
-        return paths[evt.index] if paths and evt.index < len(paths) else None
-
-    def _on_end_select(evt: gr.SelectData, paths):
         return paths[evt.index] if paths and evt.index < len(paths) else None
 
     start_gallery.select(
         fn=_on_start_select, inputs=[start_paths], outputs=[start_select])
-    end_gallery.select(
-        fn=_on_end_select, inputs=[end_paths], outputs=[end_select])
 
     # ── Wire buttons ──
     plan_btn.click(
@@ -462,18 +406,12 @@ def build_generation_tab():
     start_btn.click(
         fn=handle_start_frames,
         inputs=[session_state, prompt_editor],
-        outputs=[log_out, start_gallery, start_paths, end_btn, start_select],
-    )
-
-    end_btn.click(
-        fn=handle_end_frames,
-        inputs=[session_state, start_select],
-        outputs=[log_out, end_gallery, end_paths, video_btn, end_select],
+        outputs=[log_out, start_gallery, start_paths, video_btn, start_select],
     )
 
     video_btn.click(
         fn=handle_video_keyframe,
-        inputs=[session_state, start_select, end_select],
+        inputs=[session_state, start_select],
         outputs=[log_out, session_state, video_out, next_btn, compose_btn],
     )
 
@@ -481,8 +419,7 @@ def build_generation_tab():
         fn=handle_next_segment,
         inputs=[session_state],
         outputs=[prompt_editor, start_gallery, start_paths, start_select,
-                 end_gallery, end_paths, end_select,
-                 video_btn, start_btn, end_btn, compose_btn, next_btn],
+                 start_btn, video_btn, compose_btn, next_btn],
     )
 
     compose_btn.click(
@@ -496,9 +433,7 @@ def build_generation_tab():
         inputs=[],
         outputs=[storyboard_out, video_out, log_out, session_state,
                  prompt_editor, start_gallery, start_paths,
-                 end_gallery, end_paths,
-                 start_select, end_select,
-                 video_btn, start_btn, end_btn,
+                 start_select, start_btn, video_btn,
                  compose_btn, next_btn],
     )
 

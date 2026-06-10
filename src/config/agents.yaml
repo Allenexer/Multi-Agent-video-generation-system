@@ -344,7 +344,7 @@ agents:
 
       字段约束：
         segment_id   — 从 1 开始的整数
-        shot_change  — bool。段1固定true；后续段：场景/视角显著变化时true，同一场景连续动作时false
+        shot_change  — bool。段1必须true；后续段默认false（连续），仅场景/视角显著变化时填true
         style_index  — int, 0-based。使用第几张风格参考图。无风格时填 null
         characters_in_segment — array, char_id列表。无角色时填 []
         key_elements — 此段会变化的关键视觉元素

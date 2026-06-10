@@ -30,7 +30,7 @@ from core.image_ref import (
     get_by_type, get_by_label, get_style_by_index,
 )
 from tools import (
-    CogVideoXTool, KeyframeExtractor, VideoConcatTool,
+    CogVideoXTool, SeedanceTool, KeyframeExtractor, VideoConcatTool,
 )
 import agents  # noqa: F401 — triggers @register_agent decorators
 
@@ -86,8 +86,9 @@ class PipelineSession:
     errors: list = field(default_factory=list)
     phase: str = "init"  # "init" | "planned" | "generated" | "composed"
     gen_index: int = 0        # current segment index for stepped generation
-    last_end_frame: str = ""  # previous segment's selected end frame
-    char_end_frames: dict = field(default_factory=dict)  # char_id → last end_frame
+    last_end_frame: str = ""  # prev video last frame (continuity anchor)
+    char_portraits: dict = field(default_factory=dict)  # char_id → {style_index: image_path}
+    char_end_frames: dict = field(default_factory=dict)  # char_id → last end_frame (visual continuity)
 
 
 class PipelineExecutor:
@@ -96,6 +97,7 @@ class PipelineExecutor:
         self.config = config or ConfigManager.get_instance()
         self.factory = AgentFactory(self.config)
         self.video_gen = CogVideoXTool()
+        self.seedance = SeedanceTool()
         self.extractor = KeyframeExtractor()
         self.concat = VideoConcatTool()
         self.run_dir = ""
@@ -630,6 +632,10 @@ class PipelineExecutor:
                 _log(f"  ✗ ConsistencyGuard重跑失败: {e}")
                 break
 
+        # ── Generate character portraits (char × style) ──
+        self.generate_character_portraits(session,
+                                          progress_callback=progress_callback)
+
         # ── Anchors ──
         anchors = self._extract_anchors(context)
 
@@ -793,15 +799,118 @@ class PipelineExecutor:
 
         return session
 
-    def _get_ref_images(self, session, style_idx, seg_chars=None):
-        """Build reference image list: style, then character originals,
-        then previous end_frames of characters that have appeared before."""
+    @staticmethod
+    def _download_seedance_video(url: str) -> str:
+        """Download Seedance video via Ark SDK (authenticated TOS access)."""
+        import tempfile
+        from volcenginesdkarkruntime import Ark
+        import requests
+
+        fd, path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+
+        ark_key = os.environ.get("ARK_API_KEY", "")
+
+        # Approach 1: Ark SDK HTTP client (should auto-sign TOS requests)
+        try:
+            client = Ark(
+                base_url="https://ark.cn-beijing.volces.com/api/v3",
+                api_key=ark_key,
+            )
+            r = client._client.get(url)
+            if r.status_code == 200:
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                return path
+        except Exception:
+            pass
+
+        # Approach 2: requests with Bearer token
+        try:
+            r = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {ark_key}"} if ark_key else {},
+                stream=True, timeout=120)
+            if r.status_code == 200:
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                return path
+        except Exception:
+            pass
+
+        # Approach 3: direct download (some URLs are pre-signed)
+        try:
+            r = requests.get(url, stream=True, timeout=120)
+            if r.status_code == 200:
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                return path
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"Cannot download Seedance video: {url}\n"
+            f"请打开控制台手动下载: "
+            f"https://console.volcengine.com/ark/region:ark+cn-beijing")
+
+    def generate_character_portraits(
+        self, session: PipelineSession, progress_callback=None):
+        """Generate character portraits for each character × style combination.
+        Called once after planning. Stores in session.char_portraits[char_id][style_idx].
+        """
+        from tools.image_gen import SeedreamTool
+        char_refs = get_by_type(session.refs, "character")
+        style_refs = get_by_type(session.refs, "style")
+        if not char_refs or not style_refs:
+            return
+        seedream = SeedreamTool()
+        port_dir = os.path.join(session.run_dir, "portraits")
+        os.makedirs(port_dir, exist_ok=True)
+        for cr in char_refs:
+            cid = f"char_{cr.index}"
+            session.char_portraits.setdefault(cid, {})
+            for sr in style_refs:
+                si = sr.index
+                prompt = (
+                    f"角色参考图中的角色，以风格参考图的视觉风格呈现。"
+                    f"保持角色的核心特征完全不变（面部、体型、服装、标志性元素），"
+                    f"仅将渲染方式适配为风格参考图的艺术风格。"
+                    f"cinematic quality, 8K, highly detailed")
+                if progress_callback:
+                    progress_callback(
+                        "log",
+                        f"[Portrait] {cid} × style_{si} 生成中...")
+                results = seedream.generate(
+                    prompt=prompt,
+                    reference_images=[sr.path, cr.path],
+                    num_images=1)
+                if results:
+                    dest = os.path.join(
+                        port_dir, f"{cid}_style{si}.png")
+                    import shutil
+                    shutil.copy(results[0], dest)
+                    session.char_portraits[cid][si] = dest
+                    if progress_callback:
+                        progress_callback(
+                            "log",
+                            f"[Portrait] {cid} × style_{si} → {dest}")
+
+    def _get_ref_images(self, session, style_idx, seg_chars=None,
+                         include_style=True):
+        """Build reference images for Seedream keyframe generation.
+
+        include_style: only True on shot_change (new shots need style anchor).
+        Character refs (originals + previous end frames) always included.
+        """
         refs = []
-        # 1. Style reference
-        style_ref_images = session.anchors.get("style_ref_images", [])
-        if (style_idx is not None
-                and 0 <= style_idx < len(style_ref_images)):
-            refs.append(style_ref_images[style_idx])
+        # 1. Style reference — only on new shots
+        if include_style:
+            style_ref_images = session.anchors.get("style_ref_images", [])
+            if (style_idx is not None
+                    and 0 <= style_idx < len(style_ref_images)):
+                refs.append(style_ref_images[style_idx])
 
         # 2. Original character reference images
         char_refs = get_by_type(session.refs, "character")
@@ -809,8 +918,16 @@ class PipelineExecutor:
             if os.path.exists(cr.path):
                 refs.append(cr.path)
 
-        # 3. Previous end_frames of reappearing characters (防止走样)
-        if seg_chars and session.char_end_frames:
+        # 3. Character portraits (precise, style-matched identity reference)
+        if seg_chars and session.char_portraits and style_idx is not None:
+            for cid in seg_chars:
+                portraits = session.char_portraits.get(cid, {})
+                port = portraits.get(int(style_idx))
+                if port and os.path.exists(port):
+                    refs.append(port)
+
+        # 4. Character end frames (visual continuity, only on continuous segments)
+        if not include_style and seg_chars and session.char_end_frames:
             for cid in seg_chars:
                 prev = session.char_end_frames.get(cid)
                 if prev and os.path.exists(prev):
@@ -847,65 +964,37 @@ class PipelineExecutor:
         self,
         session: PipelineSession,
         segment_index: int,
-        mode: str = "end",       # "start" | "end"
-        start_frame: str = None,  # required when mode="end"
         num_images: int = 4,
         progress_callback=None,
     ) -> list[str]:
-        """Generate start or end keyframe candidates via Seedream.
+        """Generate start keyframe candidates via Seedream.
 
-        mode="start": fresh generation from prompt + style/char refs.
-        mode="end":   anchored to start_frame for visual continuity.
-
+        Only called when shot_change=true (new shot).
+        Style refs passed only on shot change; character refs always included.
         Returns list of saved PNG paths.
-        Saves to session.run_dir/keyframes/seg_NN/
         """
         seg = session.shots[segment_index]
-        prompt = seg.get("prompt", "")
+        prompt = seg.get("prompt_start") or seg.get("prompt", "")
         style_idx = seg.get("style_index")
+        shot_change = seg.get("shot_change", False)
         seg_chars = (seg.get("characters_in_segment")
                      or seg.get("characters_in_shot") or [])
-        ref_images = self._get_ref_images(session, style_idx, seg_chars)
+
+        ref_images = self._get_ref_images(
+            session, style_idx, seg_chars,
+            include_style=shot_change)  # style only on new shots
 
         kf_dir = os.path.join(
             session.run_dir, "keyframes",
             f"seg_{(segment_index + 1):02d}")
         os.makedirs(kf_dir, exist_ok=True)
 
-        if mode == "end" and start_frame:
-            # End frame: anchored to start_frame, use prompt_end
-            refs = [start_frame] + ref_images
-            frame_prompt = (
-                f"SCENE CONTINUITY RULE: All static scene elements must "
-                f"remain identical to the reference image in position, "
-                f"shape, scale, and existence — including spatial "
-                f"relationships between objects, distances from boundaries, "
-                f"relative layout. Change is only allowed when explicitly "
-                f"caused by camera movement named in the prompt. "
-                f"If no camera movement is specified, the background must "
-                f"be pixel-identical to the reference. "
-                f"ALLOWED changes: foreground subject pose/expression, "
-                f"explicitly requested props/effects. "
-                f"FORBIDDEN: any static object shifting position; any "
-                f"object appearing or disappearing; any change to spatial "
-                f"relationships or boundary distances; any change to "
-                f"lighting direction, color, or quality that is not "
-                f"explicitly requested. "
-                f"Scene: {seg.get('prompt_end', prompt)}")
-            label = "end"
-        else:
-            # Start frame: fresh generation, use prompt_start
-            refs = ref_images
-            frame_prompt = seg.get("prompt_start", prompt)
-            label = "start"
-
         if progress_callback:
             progress_callback(
-                "log",
-                f"[Keyframes:{label}] Seedream 生成中 ({num_images}张)...")
+                "log", f"[起始帧] Seedream 生成中 ({num_images}张)...")
 
         return self._gen_frames(
-            frame_prompt, refs, num_images, kf_dir, label,
+            prompt, ref_images, num_images, kf_dir, "start",
             progress_callback=progress_callback)
 
     def generate_video_with_keyframe(
@@ -913,50 +1002,139 @@ class PipelineExecutor:
         session: PipelineSession,
         segment_index: int,
         start_frame: str,
-        end_frame: str,
         progress_callback=None,
     ) -> dict:
-        """Generate video via CogVideoX first-last-frame mode.
+        """Generate video via Seedance 2.0 with typed reference images.
 
-        Interpolates between start_frame and end_frame with prompt guidance.
+        start_frame is the visual anchor (Seedream keyframe or prev last frame).
+        Character refs (original + end frames) always included.
+        Style refs included only on shot_change.
         """
         seg = session.shots[segment_index]
-        # prompt = 首帧到尾帧的变化过程（供CogVideoX插值）
         video_prompt = seg.get("prompt", "")
+        shot_change = seg.get("shot_change", False)
+        seg_chars = (seg.get("characters_in_segment")
+                     or seg.get("characters_in_shot") or [])
+
+        # ── Build reference images in FIXED order ──
+        # Order: [start_frame, character_portraits, style_refs, char_end_frames]
+        # Prompt text explicitly tells Seedance which is the first frame.
+        ref_images = []
+        ref_labels = []  # for logging
+
+        # 1. Start frame (THE actual first frame, not just a reference)
+        if os.path.exists(start_frame):
+            ref_images.append(start_frame)
+            ref_labels.append("首帧")
+        else:
+            if progress_callback:
+                progress_callback(
+                    "log", f"[Video] ⚠ 起始帧不存在: {start_frame}")
+
+        # 2. Character portraits (style-matched identity)
+        if seg_chars and session.char_portraits:
+            style_idx = seg.get("style_index")
+            if style_idx is not None:
+                for cid in seg_chars:
+                    portraits = session.char_portraits.get(cid, {})
+                    port = portraits.get(int(style_idx))
+                    if port and os.path.exists(port):
+                        ref_images.append(port)
+                        ref_labels.append(f"{cid}_风格{style_idx}")
+
+        # 3. Character original uploads
+        char_refs = get_by_type(session.refs, "character")
+        for cr in char_refs:
+            if os.path.exists(cr.path):
+                ref_images.append(cr.path)
+                ref_labels.append(f"{cr.label}")
+
+        # 4. Style reference (only on shot change)
+        if shot_change:
+            style_idx = seg.get("style_index")
+            style_ref_images = session.anchors.get("style_ref_images", [])
+            if (style_idx is not None
+                    and 0 <= style_idx < len(style_ref_images)):
+                ref_images.append(style_ref_images[style_idx])
+                ref_labels.append(f"风格{style_idx}")
+            for cid in seg_chars:
+                session.char_end_frames.pop(cid, None)
+
+        # 5. Character end frames (visual continuity, continuous only)
+        if not shot_change and seg_chars and session.char_end_frames:
+            for cid in seg_chars:
+                prev = session.char_end_frames.get(cid)
+                if prev and os.path.exists(prev):
+                    ref_images.append(prev)
+                    ref_labels.append(f"{cid}_上段尾帧")
+
+        # ── Tell Seedance explicitly: first image IS the start frame ──
+        if ref_images and ref_labels[0] == "首帧":
+            video_prompt = (
+                f"【首帧为第1张参考图，必须从此画面开始】{video_prompt}")
+        else:
+            video_prompt = (
+                f"【无指定首帧，从文本描述的画面开始】{video_prompt}")
+
+        # ── Add per-image reference descriptions ──
+        if len(ref_images) > 1:
+            ref_desc = "；".join(
+                f"第{i+1}张={lab}" for i, lab in enumerate(ref_labels))
+            video_prompt += f" 【参考图说明：{ref_desc}】"
 
         if progress_callback:
             progress_callback(
-                "log", "[Video] 首尾帧模式生成中...")
+                "log",
+                f"[Video] 参考图{len(ref_images)}张: {', '.join(ref_labels)}")
 
-        result = self.video_gen.generate_first_last_frame(
-            first_frame=start_frame,
-            last_frame=end_frame,
+        result = self.seedance.generate(
             prompt=video_prompt,
+            reference_images=ref_images,
+            duration=5,
+            run_dir=session.run_dir,
+            progress_callback=progress_callback,
         )
 
-        # Save end_frame for character continuity (防止走样)
-        seg_chars = (seg.get("characters_in_segment")
-                     or seg.get("characters_in_shot") or [])
-        if end_frame and os.path.exists(end_frame):
-            session.last_end_frame = end_frame
-            for cid in seg_chars:
-                session.char_end_frames[cid] = end_frame
+        if result.get("error"):
+            if progress_callback:
+                progress_callback(
+                    "log", f"[Video] Seedance 失败: {result['error']}")
+            return result
 
-        # Save video to output
+        # Save video + extract last frame for next segment
         if result.get("video_url"):
             videos_dir = os.path.join(session.run_dir, "videos")
+            frames_dir = os.path.join(session.run_dir, "frames")
             os.makedirs(videos_dir, exist_ok=True)
+            os.makedirs(frames_dir, exist_ok=True)
             try:
                 import shutil
-                local = self.extractor.download_video(
-                    result["video_url"])
+                # Seedance videos need auth — try Ark SDK download first
+                local = self._download_seedance_video(result["video_url"])
                 sid = seg.get("segment_id", segment_index + 1)
                 dest = os.path.join(videos_dir, f"seg_{sid:02d}.mp4")
                 shutil.copy(local, dest)
                 result["local_video"] = dest
+
+                # Extract last frame → anchor for next segment
+                try:
+                    last_frame = self.extractor.extract_last_frame(local)
+                    lf_dest = os.path.join(
+                        frames_dir, f"seg_{sid:02d}_last.png")
+                    shutil.copy(last_frame, lf_dest)
+                    result["last_frame"] = lf_dest
+                    session.last_end_frame = lf_dest
+                    if not shot_change:
+                        for cid in seg_chars:
+                            session.char_end_frames[cid] = lf_dest
+                    if progress_callback:
+                        progress_callback(
+                            "log", f"[Video] 末帧锚定: {lf_dest}")
+                except Exception:
+                    result["last_frame"] = None
+
                 if progress_callback:
-                    progress_callback(
-                        "log", f"[Video] 保存: {dest}")
+                    progress_callback("log", f"[Video] 保存: {dest}")
             except Exception as e:
                 if progress_callback:
                     progress_callback(
