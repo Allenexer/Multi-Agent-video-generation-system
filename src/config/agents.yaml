@@ -299,7 +299,7 @@ agents:
       - 必须详细到每一秒的变化：0-1s 发生什么，1-3s 发生什么，3-5s 发生什么
       - 字数 ≥ 80 字
 
-      prompt 写作规范（三种 prompt 各司其职）：
+      prompt 写作规范（两种 prompt 各司其职）：
       - 三种 prompt 都必须包含精确的空间方位信息（极其重要！AI模型有正面朝向偏向，必须用强力语言纠正）：
         * 角色朝向：用"侧面朝向镜头""背对镜头""完全面朝左侧，与镜头成90度角"
           等明确角度词。避免"面朝观众""正面站立"等导致角色正面朝向镜头的描述
@@ -308,15 +308,9 @@ agents:
         * 光源方向（来自画面左上/右侧/背后等）
         * 禁止使用"面朝镜头""面向观众""正面朝向"等描述
       - prompt_start: 精确描述起始帧静态画面。空间方位必须明确。
-      - prompt_end: 精确描述结束帧画面（5秒后）。
-        所有静态场景元素必须与起始帧保持位置/形状/比例/存在性一致。
-        变化仅允许由 prompt 中明确指出的镜头运动驱动，无镜头运动则背景不可变。
-        允许：前景主体姿态表情、明确要求的道具特效。
-        禁止：任何静态物体位移、物体凭空出现消失、空间关系或边界间距改变、
-        未明确要求的光源方向/颜色/质感变化。
-        若镜头运动，标注方向和预期边界延伸。
-      - prompt: 描述起始帧→结束帧的变化过程，供 CogVideoX 插值。
-        重点描述动作方向、运镜轨迹、光线变化。
+      - （prompt_end 已废弃，不再需要。）
+      - prompt: 描述5秒内从起始帧开始的完整动作序列，供 Seedance 视频生成。
+        重点：角色动作、镜头运动、光线变化、特效演进。
       - 全部中文为主，英文关键词保留：cinematic lighting, 8K, highly detailed, 及风格术语
 
       输出 JSON（严格遵循）：
@@ -333,8 +327,7 @@ agents:
             "characters_in_segment": ["char_1"],
             "key_elements": ["此段关键视觉元素"],
             "prompt_start": "起始帧精确画面描述（中文，静态场景）",
-            "prompt_end": "结束帧精确画面描述（中文，5秒后的演进画面）",
-            "prompt": "起始帧→结束帧的变化过程描述（中文）+ cinematic lighting, 8K, highly detailed",
+            "prompt": "5秒内从起始帧开始的完整动作序列（中文）+ cinematic lighting, 8K, highly detailed",
             "negative_prompt": "不需要的元素"
           }
         ],
@@ -348,9 +341,8 @@ agents:
         style_index  — int, 0-based。使用第几张风格参考图。无风格时填 null
         characters_in_segment — array, char_id列表。无角色时填 []
         key_elements — 此段会变化的关键视觉元素
-        prompt_start — 起始帧精确画面（静态单帧描述）
-        prompt_end   — 结束帧精确画面（5秒后，须有明显演进）
-        prompt       — 首帧到尾帧的变化过程（供CogVideoX插值）
+        prompt_start — 起始帧精确画面（静态单帧描述，供Seedream生成首帧）
+        prompt       — 5秒动作序列（供Seedance视频生成）
 
   prompt_engineer:
     name: "PromptEngineer（提示工程师）"

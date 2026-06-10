@@ -976,7 +976,8 @@ class PipelineExecutor:
         seg = session.shots[segment_index]
         prompt = seg.get("prompt_start") or seg.get("prompt", "")
         style_idx = seg.get("style_index")
-        shot_change = seg.get("shot_change", False)
+        # Default: segment_index==0 must be shot_change (no prev video)
+        shot_change = seg.get("shot_change", segment_index == 0)
         seg_chars = (seg.get("characters_in_segment")
                      or seg.get("characters_in_shot") or [])
 
@@ -990,8 +991,14 @@ class PipelineExecutor:
         os.makedirs(kf_dir, exist_ok=True)
 
         if progress_callback:
+            ref_names = []
+            for r in ref_images:
+                bn = os.path.basename(r)
+                ref_names.append(bn[:40])
             progress_callback(
-                "log", f"[起始帧] Seedream 生成中 ({num_images}张)...")
+                "log", f"[起始帧] Seedream生成({num_images}张) "
+                f"shot_change={shot_change} style_idx={style_idx} "
+                f"参考图({len(ref_images)}): {ref_names}")
 
         return self._gen_frames(
             prompt, ref_images, num_images, kf_dir, "start",
@@ -1012,7 +1019,8 @@ class PipelineExecutor:
         """
         seg = session.shots[segment_index]
         video_prompt = seg.get("prompt", "")
-        shot_change = seg.get("shot_change", False)
+        # Default: segment_index==0 must be shot_change (no prev video)
+        shot_change = seg.get("shot_change", segment_index == 0)
         seg_chars = (seg.get("characters_in_segment")
                      or seg.get("characters_in_shot") or [])
 
@@ -1071,7 +1079,7 @@ class PipelineExecutor:
         # ── Tell Seedance explicitly: first image IS the start frame ──
         if ref_images and ref_labels[0] == "首帧":
             video_prompt = (
-                f"【首帧为第1张参考图，必须从此画面开始】{video_prompt}")
+                f"【第1张参考图是本视频的第一帧。视频从这张图开始，延续其中的场景、角色、构图、光线，在此基础上自然演进。】{video_prompt}")
         else:
             video_prompt = (
                 f"【无指定首帧，从文本描述的画面开始】{video_prompt}")
