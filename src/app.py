@@ -274,7 +274,7 @@ def handle_next_segment(session_state):
                 gr.update(interactive=True),  # compose ready
                 gr.update(interactive=False))
     prompt_val = seg.get("prompt", "")
-    shot_change = seg.get("shot_change", False) if seg else False
+    shot_change = seg.get("shot_change", False)
     prev_end = getattr(session_state, 'last_end_frame', '')
 
     if not shot_change and prev_end:
