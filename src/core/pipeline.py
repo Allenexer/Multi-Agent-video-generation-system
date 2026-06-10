@@ -562,6 +562,74 @@ class PipelineExecutor:
         # ── Preserve all prompt candidates for UI selection ──
         self._preserve_candidates(context)
 
+        # ── Agent: ConsistencyGuard → ScenePlanner feedback loop ──
+        MAX_CONSISTENCY_RETRIES = 3
+        for retry in range(MAX_CONSISTENCY_RETRIES):
+            cg = context.get("consistency_guard", {})
+            if not isinstance(cg, dict):
+                break
+            report = cg.get("consistency_report", {})
+            if report.get("pass"):
+                _log(f"  ✓ ConsistencyGuard 通过 (第{retry+1}轮)")
+                break
+            if retry >= MAX_CONSISTENCY_RETRIES - 1:
+                _log(f"  ⚠ 已达{MAX_CONSISTENCY_RETRIES}轮上限，接受当前方案")
+                break
+            _log(f"  ⟳ Agent纠错: 第{retry+1}轮未通过，反馈修正...")
+            issues = cg.get("issues", [])
+            fixes = cg.get("fix_suggestions", {})
+
+            # Feed back to ScenePlanner for revision
+            sp_agent = self.factory.create("scene_planner")
+            sp_task = {
+                "user_input": expanded_input,
+                "stage": "storyboard",
+                "upstream": list(context.keys()),
+                "available_images": img_desc,
+                "consistency_issues": issues,
+                "fix_instructions": fixes,
+                "is_revision": True,
+            }
+            try:
+                sp_result = sp_agent.think(
+                    task=sp_task, context=context, image_paths=None)
+                context["scene_planner"] = sp_result
+            except Exception as e:
+                _log(f"  ✗ ScenePlanner修正失败: {e}")
+                break
+
+            # Re-optimize prompts
+            pe_agent = self.factory.create("prompt_engineer")
+            pe_task = {
+                "user_input": expanded_input,
+                "stage": "optimization",
+                "upstream": list(context.keys()),
+                "available_images": img_desc,
+            }
+            try:
+                pe_result = pe_agent.think(
+                    task=pe_task, context=context, image_paths=None)
+                context["prompt_engineer"] = pe_result
+            except Exception as e:
+                _log(f"  ✗ PromptEngineer重跑失败: {e}")
+
+            # Re-check consistency
+            guard_agent = self.factory.create("consistency_guard")
+            guard_task = {
+                "user_input": expanded_input,
+                "stage": "review",
+                "upstream": list(context.keys()),
+                "available_images": img_desc,
+            }
+            try:
+                guard_result = guard_agent.think(
+                    task=guard_task, context=context,
+                    image_paths=all_paths if all_paths else None)
+                context["consistency_guard"] = guard_result
+            except Exception as e:
+                _log(f"  ✗ ConsistencyGuard重跑失败: {e}")
+                break
+
         # ── Anchors ──
         anchors = self._extract_anchors(context)
 

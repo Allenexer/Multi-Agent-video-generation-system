@@ -301,7 +301,8 @@ def handle_next_segment(session_state):
     - shot_change=false: inherit previous end_frame as start_frame
     """
     if session_state is None:
-        return (gr.update(), None, [], None, None, [], None,
+        return (gr.update(), gr.update(value=None, interactive=False), [], None,
+                gr.update(value=None, interactive=False), [], None,
                 gr.update(interactive=False), gr.update(interactive=False),
                 gr.update(interactive=False), gr.update(interactive=False),
                 gr.update())
@@ -314,9 +315,8 @@ def handle_next_segment(session_state):
     if not shot_change and prev_end:
         # Continuity: directly inherit previous end_frame as start
         return (gr.update(value=prompt_val),
-                [prev_end], [prev_end], prev_end,  # start = inherited
-                None, [], None,
-                gr.update(interactive=False),
+                gr.update(value=[prev_end], interactive=True), [prev_end], prev_end,
+                gr.update(value=None, interactive=False), [], None,
                 gr.update(interactive=False),   # start_btn: already have
                 gr.update(interactive=True),    # end_btn: ready
                 gr.update(interactive=False),
@@ -325,7 +325,8 @@ def handle_next_segment(session_state):
         # Shot change: regenerate start frame
         # (char_end_frames auto-injected by pipeline for consistency)
         return (gr.update(value=prompt_val),
-                None, [], None, None, [], None,
+                gr.update(value=None, interactive=False), [], None,
+                gr.update(value=None, interactive=False), [], None,
                 gr.update(interactive=False),
                 gr.update(interactive=True),    # start_btn: generate
                 gr.update(interactive=False),   # end_btn: wait
@@ -366,8 +367,9 @@ def handle_composition(session_state):
 
 
 def handle_reset():
-    return ({}, None, "", None, gr.update(value=""), None, [],
-            None, [], None, None,
+    return ({}, None, "", None, gr.update(value=""),
+            gr.update(value=None, interactive=False), [],
+            gr.update(value=None, interactive=False), [], None, None,
             gr.update(interactive=False), gr.update(interactive=False),
             gr.update(interactive=False), gr.update(interactive=False),
             gr.update(interactive=False))

@@ -85,6 +85,13 @@ agents:
       context_key   — 仅可选: style_analysis | script | character_design | storyboard | consistency_check
       image_index   — 0-based 整数，不得超过 reference_image_count - 1
 
+      ── 动态调度规则 ──
+      5. 如果 intent_type 为 modify_existing：
+         → 分析用户要修改哪些镜头（定位 shot_id）
+         → 仅调度受影响的最少 Agent（如只改 prompt → 仅 prompt_engineer）
+         → 避免全量重新规划，最小化 API 成本
+      6. Director 自主判断：如果用户需求可一步完成（如简单场景），减少调度 Agent 数
+
       ── 负面约束（禁止事项）──
       - 绝对禁止在 task_queue 中使用未声明的 agent ID（如 video_generator 等）
       - 绝对禁止在 task_queue 中调度 critic，系统自动调用

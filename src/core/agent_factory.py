@@ -52,6 +52,12 @@ class AgentFactory:
         prompt = agent_cfg.get("prompt", "")
         model_type = agent_cfg.get("model_type", "text")
 
+        # ── Tool registration for specialized agents ──
+        tools = []
+        if agent_id == "style_analyzer":
+            from tools.image_analysis import ImageAnalysisTool
+            tools.append(ImageAnalysisTool())
+
         cls = _SPECIALIZED.get(agent_id, BaseAgent)
         agent = cls(
             name=agent_id,
@@ -60,6 +66,7 @@ class AgentFactory:
             model=model,
             model_type=model_type,
             cache=_SHARED_CACHE,
+            tools=tools,
         )
         self._cache[agent_id] = agent
         return agent
